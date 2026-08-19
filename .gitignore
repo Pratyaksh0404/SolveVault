@@ -1,0 +1,14 @@
+# OS files
+.DS_Store
+Thumbs.db
+
+# Editor
+.idea/
+.vscode/
+
+# Build output (from package.py)
+dist/
+
+# Never commit anything that looks like a token or secret
+*.env
+secrets.local.json

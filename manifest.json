@@ -1,0 +1,49 @@
+{
+  "manifest_version": 3,
+  "name": "SolveVault",
+  "version": "0.1.0",
+  "description": "Automatically pushes accepted LeetCode and GFG solutions to your own GitHub repos. No OAuth app, no relay server — just your browser and GitHub.",
+  "minimum_chrome_version": "111",
+
+  "permissions": ["storage"],
+  "host_permissions": [
+    "https://leetcode.com/*",
+    "https://www.geeksforgeeks.org/*",
+    "https://api.github.com/*"
+  ],
+
+  "content_security_policy": {
+    "extension_pages": "default-src 'self'; connect-src 'self' https://api.github.com https://leetcode.com https://www.geeksforgeeks.org"
+  },
+
+  "background": {
+    "service_worker": "background.js"
+  },
+
+  "options_page": "options.html",
+
+  "content_scripts": [
+    {
+      "matches": ["https://leetcode.com/problems/*"],
+      "js": ["content-scripts/leetcode-main.js"],
+      "world": "MAIN",
+      "run_at": "document_start"
+    },
+    {
+      "matches": ["https://leetcode.com/problems/*"],
+      "js": ["content-scripts/leetcode-bridge.js"],
+      "run_at": "document_start"
+    },
+    {
+      "matches": ["https://www.geeksforgeeks.org/problems/*"],
+      "js": ["content-scripts/gfg-main.js"],
+      "world": "MAIN",
+      "run_at": "document_start"
+    },
+    {
+      "matches": ["https://www.geeksforgeeks.org/problems/*"],
+      "js": ["content-scripts/gfg-bridge.js"],
+      "run_at": "document_start"
+    }
+  ]
+}
