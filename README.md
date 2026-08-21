@@ -316,8 +316,10 @@ Bug reports, new platform support, and pull requests are all welcome. If you're 
 
 ## License
 
-MIT — see [LICENSE](LICENSE). Use it, fork it, publish it — just keep the trust model intact if you do.
+MIT — see [LICENSE](LICENSE). 
+
+Use it, fork it, publish it — just keep the trust model intact if you do.
 
 ## Author
 
-Pratyaksh Agrawal
+### Pratyaksh Agrawal
