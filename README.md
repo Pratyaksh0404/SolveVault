@@ -1,36 +1,61 @@
+<div align="center">
+
 # SolveVault
 
-Automatically pushes accepted submissions from LeetCode and GeeksforGeeks to your own GitHub repos the moment they're accepted — full solution code, a formatted problem description, and an auto-updating stats table, all without a single OAuth app, relay server, or third party in the loop.
+**LeetCode + GeeksforGeeks → GitHub. (Automatically).**
 
-> Built for competitive programmers and DSA practitioners who want a private, automatic, zero-trust archive of everything they've solved.
+Solve a problem, get Accepted, and your solution with a formatted problem statement and updated stats is already committed to your own GitHub repo. No copy-paste, no manual commits, no third party in between.
+
+[![License: MIT](https://img.shields.io/badge/License-MIT-blue.svg)](LICENSE)
+[![Manifest ](https://img.shields.io/badge/Chrome-Manifest%20-brightgreen)](manifest.json)
+[![No backend](https://img.shields.io/badge/backend-none-informational)](#trust-model)
+
+</div>
 
 ---
 
-## Trust model
+## Submit → Accepted → GitHub
 
-```
-Your browser (SolveVault extension) ──HTTPS──> api.github.com
-                                     ──HTTPS──> leetcode.com / geeksforgeeks.org
+```mermaid
+sequenceDiagram
+    participant You
+    participant Platform as LeetCode / GFG
+    participant SolveVault
+    participant GitHub
+
+    You->>Platform: Submit solution
+    Platform-->>SolveVault: Accepted (detected in your browser)
+    SolveVault->>GitHub: commit — solution code
+    SolveVault->>GitHub: commit — formatted problem README
+    SolveVault->>GitHub: commit — updated stats.json
+    SolveVault->>GitHub: commit — updated repo index
+    GitHub-->>You: 4 real commits, live in seconds
 ```
 
-That's the entire network graph. Nobody's server sits in the middle. The token lives only in `chrome.storage.local` on your machine, scoped by GitHub itself to exactly the two repos you choose. Your code is read from the page, pushed, and discarded — never written to disk, never sent anywhere but GitHub.
+✅ Exact solution code, as submitted
+
+✅ Problem description converted to real Markdown — lists, bold text, code blocks
+
+✅ Auto-updated stats table (solved count, difficulty breakdown)
+
+✅ You generate the GitHub token yourself, scoped to exactly two repos
+
+✅ No SolveVault backend, no OAuth app, no relay server
+
+✅ Every network call is in one ~330-line file you can read end to end
 
 ---
 
 ## What it does
 
-- Watches LeetCode submissions via its internal GraphQL API (the same calls LeetCode's own UI makes) and detects an "Accepted" verdict
-- Watches GFG submissions via DOM detection for its "Problem Solved Successfully" banner (GFG has no public submission API)
-- On success, automatically:
-  - Pushes `Solution.<ext>` with your exact submitted code
-  - Creates a `README.md` inside the problem folder with the full formatted problem statement — real bullet lists, bold text, and fenced code blocks, not a flattened wall of text
-  - Updates the repo-wide `README.md` stats table (total solved, difficulty breakdown, problem index)
-- All of the above happens in one commit sequence, seconds after you hit Submit
-
-**Supported platforms**
+- ⚡ Watches for an accepted submission on LeetCode and GeeksforGeeks
+- 📄 Fetches the problem statement and converts it to clean Markdown — real bullet lists, bold text, fenced code blocks, not a flattened paragraph
+- 💻 Captures your exact submitted code and language
+- 📊 Maintains a per-repo stats file and a root `README.md` index, kept in the repo itself — nothing tracked locally
+- 🔐 Talks to GitHub using a token *you* create, scoped to *only* the repos you choose
 
 | Platform | Status |
-|:---------|:------:|
+|---|---|
 | LeetCode | ✅ Working |
 | GeeksforGeeks | ✅ Working |
 | Codeforces | 🔜 Planned |
@@ -39,120 +64,260 @@ That's the entire network graph. Nobody's server sits in the middle. The token l
 
 ---
 
-## Setup
+## Why SolveVault
 
-### 1. Create your GitHub repos
+Automatically archiving solved problems is genuinely useful but **how** a tool gets write access to your GitHub account matters just as much as what it does once it has it.
 
-On github.com, create two **empty** repos (private or public, your choice):
-- `leetcode-solutions`
-- `gfg-solutions`
+SolveVault is built so the access model is as narrow as the job requires:
 
-Don't clone them anywhere. SolveVault talks to them purely via the GitHub REST API — no local git clone is needed or used.
+- You create a **fine-grained Personal Access Token** yourself, on GitHub's own settings page
+- You choose **exactly which repositories** it can touch — typically two
+- The only permission granted is **Contents: Read and write**
+- You control the token's expiry and can revoke it any time, independent of this extension
 
-### 2. Create a fine-grained Personal Access Token
-
-Go to **github.com/settings/personal-access-tokens/new**:
-- Resource owner → your account
-- Repository access → **Only select repositories** → pick the two repos above
-- Permissions → **Contents: Read and write** (only this — nothing else needed)
-- Set an expiry (90 days recommended; GitHub will remind you to rotate)
-- Click Generate, copy the token once
-
-This token can *only* touch those two repos. It cannot read your email, your other repos, your org data, or perform any administrative action. If it ever leaked, the blast radius is "someone could write files to two solution repos" — nothing more.
-
-### 3. Load the extension
-
-1. Clone or download this repo to a permanent location (don't delete the folder after loading — Chrome loads unpacked extensions by reference)
-2. Go to `chrome://extensions`
-3. Toggle **Developer mode** on (top right)
-4. Click **Load unpacked** → select the project folder
-5. Pin the extension icon if you like (optional)
-
-### 4. Configure it
-
-Right-click the extension icon → **Options** (or click the icon if it opens Options directly). Fill in:
-- Your Personal Access Token
-- `yourname/leetcode-solutions`
-- `yourname/gfg-solutions`
-
-Click **Save**.
-
-### 5. Use it
-
-Solve a problem on LeetCode or GFG, click Submit, wait for the accepted verdict — that's it. Check your GitHub repo; the commit will already be there.
+There's no OAuth application registered anywhere, no backend service brokering access, and no step where a credential passes through infrastructure other than your browser and GitHub's own servers.
 
 ---
 
-## What ends up in your repo
+## How it works
 
+1. You submit a solution on a LeetCode or GFG problem page
+2. A content script running in that page detects the accepted verdict via LeetCode's own GraphQL response for LeetCode, via a DOM watcher for GFG (see [GFG notes](#a-note-on-gfg))
+3. The background service worker fetches the problem's title, difficulty, and description
+4. The description's HTML is converted to Markdown code blocks, lists, and bold/italic text are preserved, not stripped
+5. Four real git commits are constructed directly through GitHub's Git Data API (blob → tree → commit → ref update) and pushed to your repo, one after another
+
+```mermaid
+flowchart LR
+    subgraph Browser["Your Browser"]
+        CS["Content script<br/>(watches the page)"]
+        BG["Background service worker<br/>(background.js)"]
+        CS -- "accepted code" --> BG
+    end
+    LC[("leetcode.com")]
+    GFG[("geeksforgeeks.org")]
+    GH[("api.github.com")]
+
+    CS -.-> LC
+    CS -.-> GFG
+    BG -- "your token" --> GH
+    GH --> R1[("leetcode-solutions")]
+    GH --> R2[("gfg-solutions")]
 ```
+
+---
+
+## What gets pushed
+
+```text
 leetcode-solutions/
 ├── .sync-meta/
-│   └── stats.json          ← internal stats, do not edit manually
+│   └── stats.json              ← internal index, don't edit by hand
 ├── two-sum/
 │   ├── Solution.py
-│   └── README.md           ← formatted problem statement
-├── longest-palindrome/
+│   └── README.md
+├── jump-game-ii/
 │   ├── Solution.py
 │   └── README.md
-└── README.md               ← auto-generated index table, updated on every solve
+└── README.md                   ← auto-generated index, regenerated every solve
 ```
 
-The root `README.md` looks like this:
+**`Solution.<ext>`** — your exact submitted code. Extension is inferred from the submission language (`python3` → `.py`, `cpp` → `.cpp`, GFG's Ace editor mode IDs like `c_cpp` are mapped too).
 
-| # | Problem | Difficulty | Language |
-|---|---|---|---|
-| 1 | Longest Palindrome | Easy | python3 |
-| 2 | Two Sum | Easy | python3 |
+**`README.md`** (per problem) — the problem statement, converted from raw HTML into real Markdown by a dependency-free converter in `background.js` — no DOM APIs, since this runs in a service worker with no `document` available.
+
+**Root `README.md`** — regenerated after every solve from `.sync-meta/stats.json`, which lives in the repo itself. Nothing about your progress is tracked on your machine.
+
+<details>
+<summary><strong>Example of a generated problem README</strong></summary>
+
+````markdown
+# Jump Game II
+
+**Difficulty:** Medium
+
+You are given a **0-indexed** array of integers `nums` of length `n`.
+You are initially positioned at `nums[0]`.
+
+Each element `nums[i]` represents the maximum length of a forward jump
+from index `i`.
+
+- `0 <= j <= nums[i]`
+- `i + j < n`
+
+Return *the minimum number of jumps* to reach `nums[n - 1]`.
+
+```
+Input: nums = [2,3,1,1,4]
+Output: 2
+Explanation: The minimum number of jumps to reach the last index is 2.
+Jump 1 step from index 0 to 1, then 3 steps to the last index.
+```
+
+**Constraints:**
+
+- `1 <= nums.length <= 10^4`
+- `0 <= nums[i] <= 1000`
+````
+
+This is generated automatically from LeetCode's own problem data — nothing here is typed by hand.
+
+</details>
+
+---
+
+## Before / after
+
+<table>
+<tr>
+<th>Without SolveVault</th>
+<th>With SolveVault</th>
+</tr>
+<tr>
+<td>
+
+```text
+Solve
+  ↓
+Copy code
+  ↓
+Create folder
+  ↓
+Write description by hand
+  ↓
+git add, commit, push
+  ↓
+Manually update stats
+```
+
+</td>
+<td>
+
+```text
+Solve
+  ↓
+Accepted
+  ↓
+Already on GitHub
+```
+
+</td>
+</tr>
+</table>
 
 ---
 
-## Privacy and security
+## Trust model
 
-SolveVault was built specifically to fix the privacy problem with tools like LeetHub v2, which require authorizing a third-party GitHub OAuth App — meaning the original developer's server sits in the token exchange path and could theoretically intercept credentials or log submissions.
+**What SolveVault does *not* have:**
 
-SolveVault eliminates that entirely:
+- ❌ No OAuth application
+- ❌ No `client_id` or `client_secret` anywhere in the code
+- ❌ No backend server of any kind
+- ❌ No analytics, telemetry, or update-check pings
 
-- **No OAuth App.** You generate the token yourself on GitHub's own settings page.
-- **No relay server.** The extension talks directly from your browser to `api.github.com` over HTTPS.
-- **No backend.** There is no server to host, compromise, or trust.
-- **Fine-grained token.** GitHub scopes it to only the two repos you chose, with only Contents permission. Even in the worst case, it cannot touch anything else on your account.
-- **No local storage of code.** Your solution is held in a JS variable for the milliseconds it takes to push, then discarded. Nothing is written to disk except your GitHub repo.
+**What actually happens:**
 
-You can verify all of this by reading the source — every network call the extension makes is in `background.js`, and it contacts exactly three domains: `api.github.com`, `leetcode.com`, and `geeksforgeeks.org`.
+You generate a token on GitHub's own site, GitHub enforces what that token can touch, and your browser talks to `api.github.com` directly. If the token ever leaked, the blast radius is *"someone can write files to the repos you selected"* — not *"someone has access to my GitHub account."*
+
+<details>
+<summary><strong>Verified network destinations</strong></summary>
+
+Every `fetch()` and `XMLHttpRequest` in this codebase was checked by hand. The extension contacts exactly three hosts, and nothing else:
+
+| Destination | Purpose | Where in the code |
+|---|---|---|
+| `api.github.com` | Creating commits (blobs, trees, commit objects, ref updates), reading `stats.json` | `background.js` |
+| `leetcode.com/graphql` | Reading public problem title/difficulty/description | `background.js` |
+| `geeksforgeeks.org` | Read-only — the GFG content script only reads the DOM of the page it's already on; it makes no network requests of its own | `content-scripts/gfg-main.js` |
+
+No analytics SDK, no CDN-loaded script, no error-reporting service, no "check for updates" call.
+
+</details>
+
+<details>
+<summary><strong>What this does <em>not</em> protect against</strong></summary>
+
+Being upfront about the limits of this model:
+
+- A compromised local machine can still read `chrome.storage.local`, including the token
+- A malicious fork of this extension could behave differently from what's described here — always install from source you've reviewed or built yourself
+- This doesn't protect against vulnerabilities in Chrome, GitHub, LeetCode, or GFG themselves
+- If you grant the token more than `Contents: Read and write`, or more repos than necessary, you've widened the blast radius yourself — the extension can't undo an overly broad token
+
+</details>
+
+---
+
+## Source auditability
+
+Don't take any of the above on faith — the whole extension is small enough to read in one sitting.
+
+```text
+manifest.json          → permissions, host access, content script matches
+background.js          → every GitHub/LeetCode network call lives here (~330 lines)
+content-scripts/
+  leetcode-main.js      → detects an accepted LeetCode submission
+  leetcode-bridge.js    → relays it to background.js
+  gfg-main.js           → detects an accepted GFG submission (DOM-based)
+  gfg-bridge.js         → relays it to background.js
+options.html / options.js → where you enter your token and repo names
+```
 
 ---
 
-## What NOT to do
+## Installation
 
-- **Never commit your token** into any file in this repo. It lives in browser storage only.
-- **Don't widen `host_permissions`** in `manifest.json` beyond the three domains already listed — every extra host is extra attack surface.
-- **Don't add analytics, telemetry, or an update-check ping** to any server. If you fork this and add a backend for any reason, you've reintroduced the exact trust problem this project exists to solve.
-- **Don't use a classic OAuth App** if you add a nicer login flow later — always use fine-grained PATs or GitHub Apps with explicitly scoped repo permissions.
+1. **Create two empty GitHub repos** — e.g. `leetcode-solutions` and `gfg-solutions`. Private or public, your choice. Don't clone them anywhere; SolveVault talks to them purely through the GitHub API.
+
+2. **Create a fine-grained Personal Access Token** at [github.com/settings/personal-access-tokens/new](https://github.com/settings/personal-access-tokens/new):
+
+   ```text
+   Resource owner       → your account
+   Repository access    → Only select repositories → pick the two repos above
+   Permissions          → Contents: Read and write   (nothing else)
+   Expiration           → 90 days is a reasonable default
+   ```
+
+   Copy the token once — GitHub won't show it again.
+
+3. **Load the extension**
+   - Clone or download this repo somewhere permanent
+   - `chrome://extensions` → enable **Developer mode**
+   - **Load unpacked** → select the project folder
+
+4. **Configure it** — click the extension icon → Options, paste your token and both `owner/repo` names, Save.
+
+5. **Solve something.** Submit a problem, wait for Accepted, check your repo.
+
+---
+
+## A note on GFG
+
+GeeksforGeeks has no public API for submission results, unlike LeetCode's GraphQL layer. `gfg-main.js` instead watches the DOM with a `MutationObserver` for GFG's "Problem Solved Successfully" banner, and reads code directly from the page's Ace editor instance.
+
+This is inherently more fragile than the LeetCode integration — a GFG frontend redesign can break detection without warning. If it ever silently stops working, the comments at the top of `content-scripts/gfg-main.js` explain exactly what to re-verify in DevTools.
 
 ---
 
-## Notes on GFG
+## Roadmap
 
-GFG's frontend markup changes more often than LeetCode's since there's no stable public API to depend on. The detection relies on watching for the "Problem Solved Successfully" banner via `MutationObserver`. If it ever silently stops working after a GFG redesign, see the comments at the top of `content-scripts/gfg-main.js` for exactly what to re-verify in DevTools (typically: the success text, the editor type, and the difficulty selector).
+- Codeforces 
+- CodeChef
+- HackerRank
 
----
-
-## Token rotation
-
-Your fine-grained PAT expires on whatever schedule you chose (90 days recommended). When it expires:
-
-1. Go to **github.com/settings/personal-access-tokens**
-2. Delete the old token
-3. Generate a new one with the same settings
-4. Open the SolveVault options page and paste the new token → Save
-
-Nothing in your repos is affected — the token only controls write access, not repo contents.
+Adding a platform is two files and one config entry: a `<platform>-main.js` (detects success, grabs code), a `<platform>-bridge.js` (forwards to `background.js`), a manifest entry, and one `msg.platform === '<platform>'` branch — `recordAndPush()` is already platform-agnostic.
 
 ---
+
+## Contributing
+
+Bug reports, new platform support, and pull requests are all welcome. If you're adding a platform, follow the pattern above. If you're touching `background.js`, please keep the trust model intact — no new backend calls, no telemetry, no widened permissions — unless that change is the explicit point of the PR and clearly called out.
 
 ## License
 
-MIT — see `LICENSE`. Use it, fork it, publish it.
+MIT — see [LICENSE](LICENSE). Use it, fork it, publish it — just keep the trust model intact if you do.
 
-If you publish your own build or fork, keep the trust model intact: no server in the middle, no OAuth App you don't control, no telemetry. The whole point is that users never have to trust anyone but GitHub itself.
+## Author
+
+Pratyaksh Agrawal
