@@ -7,10 +7,16 @@ window.addEventListener('message', (event) => {
   if (event.data?.type !== 'PRIVATE_SYNC_SUCCESS') return;
   if (event.data.platform !== 'leetcode') return;
 
+  if (!chrome?.runtime?.id) {
+    console.warn('[private-sync] Extension was reloaded — refresh this tab to reconnect.');
+    return;
+  }
+
   chrome.runtime.sendMessage({
     platform: 'leetcode',
     slug: event.data.slug,
     code: event.data.code,
-    lang: event.data.lang
+    lang: event.data.lang,
+    submissionId: event.data.submissionId
   });
 });

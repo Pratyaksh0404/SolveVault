@@ -156,6 +156,34 @@ async function getJsonFile(token, owner, repo, path, fallback) {
   }
 }
 
+// ─── Duplicate-push guard ────────────────────────────────────────────────────
+
+const DEDUPE_STORE_KEY = 'recentPushes';
+const DEDUPE_WINDOW_MS = 60 * 1000; // for slug-based (no stable ID) dedupe
+const MAX_DEDUPE_ENTRIES = 500;
+
+async function isDuplicatePush(dedupeKey, permanent) {
+  const { [DEDUPE_STORE_KEY]: store = {} } = await chrome.storage.local.get(DEDUPE_STORE_KEY);
+  const now = Date.now();
+  const prev = store[dedupeKey];
+
+  if (prev !== undefined) {
+    if (permanent) return true; // same exact submission ID — always a duplicate
+    if (now - prev < DEDUPE_WINDOW_MS) return true; // same slug pushed moments ago
+  }
+
+  store[dedupeKey] = now;
+
+  const keys = Object.keys(store);
+  if (keys.length > MAX_DEDUPE_ENTRIES) {
+    keys.sort((a, b) => store[a] - store[b]);
+    for (let i = 0; i < keys.length - MAX_DEDUPE_ENTRIES; i++) delete store[keys[i]];
+  }
+
+  await chrome.storage.local.set({ [DEDUPE_STORE_KEY]: store });
+  return false;
+}
+
 function decodeEntities(str) {
   return str
     .replace(/&nbsp;/g, ' ')
@@ -296,6 +324,13 @@ async function handleMessage(msg) {
 
   if (msg.platform === 'leetcode') {
     if (!leetcodeRepo) { console.warn('[private-sync] No LeetCode repo configured.'); return; }
+
+    const dedupeKey = msg.submissionId ? `leetcode:sub:${msg.submissionId}` : `leetcode:slug:${msg.slug}`;
+    if (await isDuplicatePush(dedupeKey, !!msg.submissionId)) {
+      console.log(`[private-sync] Skipped duplicate push for ${msg.slug} (submission ${msg.submissionId})`);
+      return;
+    }
+
     const [owner, repo] = leetcodeRepo.split('/');
     const problem = await fetchLeetCodeProblem(msg.slug);
     await recordAndPush({
@@ -311,6 +346,12 @@ async function handleMessage(msg) {
 
   if (msg.platform === 'gfg') {
     if (!gfgRepo) { console.warn('[private-sync] No GFG repo configured.'); return; }
+
+    if (await isDuplicatePush(`gfg:slug:${msg.slug}`, false)) {
+      console.log(`[private-sync] Skipped duplicate push for ${msg.slug}`);
+      return;
+    }
+
     const [owner, repo] = gfgRepo.split('/');
     await recordAndPush({
       token, owner, repo,

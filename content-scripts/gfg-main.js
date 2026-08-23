@@ -41,6 +41,18 @@
     return 'text';
   }
 
+  function getDifficulty() {
+    // Try a targeted element first — more reliable than scanning all page text.
+    const el = document.querySelector('[class*="difficulty" i]');
+    if (el) {
+      const m = el.innerText.match(/Easy|Medium|Hard|Basic|School/i);
+      if (m) return m[0];
+    }
+    // Fallback: search the whole page's visible text for "Difficulty: X".
+    const bodyMatch = document.body.innerText.match(/Difficulty:\s*(Easy|Medium|Hard|Basic|School)/i);
+    return bodyMatch ? bodyMatch[1] : undefined;
+  }
+
   function getProblemMeta() {
     // document.title is reliably set by GFG for SEO (e.g. "Word in Grid -
     // All Occurrences | Practice | GeeksforGeeks"), which is more robust
@@ -48,12 +60,7 @@
     let title = document.title.split('|')[0].trim();
     if (!title) title = document.querySelector('h1')?.innerText?.trim();
 
-    // Difficulty is shown as plain visible text like "Difficulty: Medium" —
-    // search for that pattern directly instead of relying on a class name.
-    const match = document.body.innerText.match(/Difficulty:\s*(Easy|Medium|Hard|Basic|School)/i);
-    const difficulty = match ? match[1] : undefined;
-
-    return { title, difficulty };
+    return { title, difficulty: getDifficulty() };
   }
 
   function getDescription() {
@@ -79,17 +86,24 @@
       if (!code) return; // editor not found yet this tick, try again next mutation
 
       lastSent = Date.now();
-      const { title, difficulty } = getProblemMeta();
-      const slug = location.pathname.split('/problems/')[1]?.split('/')[0] || document.title;
 
-      window.postMessage({
-        type: 'PRIVATE_SYNC_SUCCESS',
-        platform: 'gfg',
-        slug, title, difficulty,
-        code,
-        lang: getLangFromEditor(),
-        description: getDescription()
-      }, '*');
+      // The success banner and the rest of the page chrome (difficulty
+      // badge, etc.) don't always finish rendering in the same tick — give
+      // it a brief moment before reading metadata, rather than reading it
+      // the instant the banner appears and sometimes missing it.
+      setTimeout(() => {
+        const { title, difficulty } = getProblemMeta();
+        const slug = location.pathname.split('/problems/')[1]?.split('/')[0] || document.title;
+
+        window.postMessage({
+          type: 'PRIVATE_SYNC_SUCCESS',
+          platform: 'gfg',
+          slug, title, difficulty,
+          code,
+          lang: getLangFromEditor(),
+          description: getDescription()
+        }, '*');
+      }, 600);
     }
   });
 

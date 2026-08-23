@@ -8,7 +8,6 @@
 (() => {
   if (window.__privateSyncHooked) return;
   window.__privateSyncHooked = true;
-  console.log('[private-sync] hook installed on', location.href);
 
   const seen = new Set(); // avoid re-pushing if you revisit an old submission page
 
@@ -36,8 +35,6 @@
             const d = data?.data?.submissionDetails;
             if (!d) return;
 
-            console.log('[private-sync] submissionDetails verdict:', d.statusCode, d.question?.titleSlug);
-
             if (d.statusCode !== 10) return; // 10 = Accepted on LeetCode
 
             const subId = JSON.parse(body).variables.submissionId;
@@ -49,7 +46,8 @@
               platform: 'leetcode',
               slug: d.question?.titleSlug,
               code: d.code,
-              lang: d.lang?.name
+              lang: d.lang?.name,
+              submissionId: subId
             }, '*');
           }).catch(() => {});
         } catch (e) {}
