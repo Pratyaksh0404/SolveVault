@@ -157,7 +157,13 @@ async function getJsonFile(token, owner, repo, path, fallback) {
 }
 
 // ─── Duplicate-push guard ────────────────────────────────────────────────────
-
+// LeetCode does a full page navigation to the submission's permalink after
+// "Accepted", and that new page independently re-issues its own
+// submissionDetails query to render the results view. A content script's
+// in-memory `seen` Set can't catch that second firing — it's a fresh script
+// instance with no memory of the first one. This persists dedup state in
+// chrome.storage.local instead, which survives navigations and service
+// worker restarts.
 const DEDUPE_STORE_KEY = 'recentPushes';
 const DEDUPE_WINDOW_MS = 60 * 1000; // for slug-based (no stable ID) dedupe
 const MAX_DEDUPE_ENTRIES = 500;
@@ -236,12 +242,12 @@ function renderReadme(entries) {
     ` &nbsp;|&nbsp; 🟡 Medium: ${counts.Medium || 0}` +
     ` &nbsp;|&nbsp; 🔴 Hard: ${counts.Hard || 0}\n\n` +
     `_Auto-generated. Do not edit by hand — it will be overwritten on the next sync._\n\n` +
-    `| # | Problem | Difficulty | Language |\n|---|---|---|---|\n`;
+    `| # | Problem | Difficulty | Language | Link |\n|---|---|---|---|---|\n`;
 
   const rows = entries
     .slice()
     .sort((a, b) => a.title.localeCompare(b.title))
-    .map((e, i) => `| ${i + 1} | [${e.title}](${e.path}) | ${e.difficulty} | ${e.language} |`)
+    .map((e, i) => `| ${i + 1} | [${e.title}](${e.path}) | ${e.difficulty} | ${e.language} | ${e.url ? `[Solve](${e.url})` : '—'} |`)
     .join('\n');
 
   return header + rows + '\n';
@@ -251,7 +257,7 @@ function renderReadme(entries) {
 // Each file change is its own real git commit, chained sequentially.
 // GitHub counts every one of them in the contribution graph.
 
-async function recordAndPush({ token, owner, repo, slug, title, difficulty, language, description, code }) {
+async function recordAndPush({ token, owner, repo, slug, title, difficulty, language, description, code, url }) {
   const folder = slug;
   const ext = extFor(language);
 
@@ -286,7 +292,7 @@ async function recordAndPush({ token, owner, repo, slug, title, difficulty, lang
 
   const stats = statsResult.data;
   const idx = stats.findIndex(e => e.slug === slug);
-  const entry = { slug, title, difficulty, language, path: `${folder}/` };
+  const entry = { slug, title, difficulty, language, path: `${folder}/`, url };
   if (idx >= 0) stats[idx] = entry; else stats.push(entry);
 
   head = await pushCommit(
@@ -340,7 +346,8 @@ async function handleMessage(msg) {
       difficulty: problem?.difficulty || 'Unknown',
       language: msg.lang,
       description: htmlToMarkdown(problem?.content),
-      code: msg.code
+      code: msg.code,
+      url: `https://leetcode.com/problems/${msg.slug}/`
     });
   }
 
@@ -360,7 +367,8 @@ async function handleMessage(msg) {
       difficulty: msg.difficulty || 'Unknown',
       language: msg.lang,
       description: htmlToMarkdown(msg.description),
-      code: msg.code
+      code: msg.code,
+      url: `https://www.geeksforgeeks.org/problems/${msg.slug}/1`
     });
   }
 }
