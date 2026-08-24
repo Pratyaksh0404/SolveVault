@@ -53,6 +53,22 @@
     return bodyMatch ? bodyMatch[1] : undefined;
   }
 
+  function getTopics() {
+
+    const pills = document.querySelectorAll('[class*="problems_tag_label" i]');
+    const topics = [];
+
+    pills.forEach(pill => {
+      const section = pill.closest('[class*="problems_accordion_tags" i]');
+      const title = section?.querySelector('[class*="problems_active_tag_title" i]')?.innerText?.trim();
+      if (title && /^topic tags?$/i.test(title)) {
+        topics.push(pill.innerText.trim());
+      }
+    });
+
+    return [...new Set(topics)].filter(Boolean);
+  }
+
   function getProblemMeta() {
     // document.title is reliably set by GFG for SEO (e.g. "Word in Grid -
     // All Occurrences | Practice | GeeksforGeeks"), which is more robust
@@ -60,7 +76,7 @@
     let title = document.title.split('|')[0].trim();
     if (!title) title = document.querySelector('h1')?.innerText?.trim();
 
-    return { title, difficulty: getDifficulty() };
+    return { title, difficulty: getDifficulty(), topics: getTopics() };
   }
 
   function getDescription() {
@@ -92,13 +108,13 @@
       // it a brief moment before reading metadata, rather than reading it
       // the instant the banner appears and sometimes missing it.
       setTimeout(() => {
-        const { title, difficulty } = getProblemMeta();
+        const { title, difficulty, topics } = getProblemMeta();
         const slug = location.pathname.split('/problems/')[1]?.split('/')[0] || document.title;
 
         window.postMessage({
           type: 'PRIVATE_SYNC_SUCCESS',
           platform: 'gfg',
-          slug, title, difficulty,
+          slug, title, difficulty, topics,
           code,
           lang: getLangFromEditor(),
           description: getDescription()

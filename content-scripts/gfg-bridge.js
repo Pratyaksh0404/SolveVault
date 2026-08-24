@@ -14,6 +14,7 @@ window.addEventListener('message', (event) => {
     slug: event.data.slug,
     title: event.data.title,
     difficulty: event.data.difficulty,
+    topics: event.data.topics,
     code: event.data.code,
     lang: event.data.lang,
     description: event.data.description

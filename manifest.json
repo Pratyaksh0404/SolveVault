@@ -5,7 +5,7 @@
   "description": "Automatically archives accepted LeetCode and GeeksforGeeks solutions to your own GitHub repos. No OAuth app, no relay server — only your browser talking directly to api.github.com with a token you generate yourself.",
   "minimum_chrome_version": "111",
 
-  "permissions": ["storage"],
+  "permissions": ["storage", "offscreen"],
   "host_permissions": [
     "https://leetcode.com/*",
     "https://www.geeksforgeeks.org/*",
@@ -13,7 +13,7 @@
   ],
 
   "content_security_policy": {
-    "extension_pages": "default-src 'self'; connect-src 'self' https://api.github.com https://leetcode.com https://www.geeksforgeeks.org"
+    "extension_pages": "default-src 'self'; connect-src 'self' https://api.github.com https://leetcode.com https://www.geeksforgeeks.org; style-src 'self' 'unsafe-inline'"
   },
 
   "background": {

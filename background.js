@@ -190,45 +190,124 @@ async function isDuplicatePush(dedupeKey, permanent) {
   return false;
 }
 
-function decodeEntities(str) {
-  return str
-    .replace(/&nbsp;/g, ' ')
-    .replace(/&lt;/g, '<').replace(/&gt;/g, '>')
-    .replace(/&amp;/g, '&').replace(/&quot;/g, '"')
-    .replace(/&#39;/g, "'");
+// ─── Offscreen document management ───────────────────────────────────────────
+// The service worker has no DOM, so real HTML parsing happens in a hidden
+// offscreen document instead (offscreen.js) — see manifest.json's
+// "offscreen" permission. This replaces the old regex-based HTML-to-Markdown
+// converter, which kept breaking on edge cases regex fundamentally can't
+// distinguish (e.g. "this dash is a bullet" vs "this dash is in a code
+// example") — a real parser sees the actual tag structure instead of
+// guessing from text patterns.
+let offscreenReady = null;
+
+async function ensureOffscreenDocument() {
+  if (offscreenReady) return offscreenReady;
+  offscreenReady = chrome.offscreen.createDocument({
+    url: 'offscreen.html',
+    reasons: ['DOM_PARSER'],
+    justification: 'Parse problem HTML into Markdown using DOMParser, unavailable in the service worker.'
+  }).catch(err => {
+    // Already exists (e.g. survived a service worker restart) — fine.
+    if (!/already exists|single offscreen/i.test(String(err))) throw err;
+  });
+  return offscreenReady;
 }
 
-function htmlToMarkdown(html) {
+async function htmlToMarkdown(html) {
   if (!html) return '';
-  let out = html;
+  await ensureOffscreenDocument();
+  const response = await chrome.runtime.sendMessage({ target: 'offscreen', type: 'CONVERT_HTML', html });
+  const converted = response?.markdown || '';
+  return bulletizeLeftoverConstraints(normalizeInlineExamples(splitConcatenatedConstraints(fixConstraintsBlock(converted))));
+}
 
-  out = out.replace(/<pre[^>]*>([\s\S]*?)<\/pre>/gi, (_, inner) => {
-    const code = decodeEntities(inner.replace(/<[^>]+>/g, ''));
-    return `\n\`\`\`\n${code.trim()}\n\`\`\`\n`;
+// Catches any constraint-shaped line that wasn't already turned into a
+// bullet by the two functions above — most commonly a single, standalone
+// constraint clause (splitConcatenatedConstraints only fires when it finds
+// 2+ clauses run together, so a lone one was falling through untouched).
+// Also handles a "**Constraints:**" label with just one clause attached on
+// the same line, splitting it into its own heading plus a bullet below.
+function bulletizeLeftoverConstraints(markdown) {
+  return markdown.split('\n').map(line => {
+    if (/^\s*-\s/.test(line)) return line; // already a bullet, leave alone
+    const trimmed = line.trim();
+    if (!trimmed) return line;
+
+    const headingMatch = trimmed.match(/^(\*\*Constraints:\*\*|Constraints:)\s*(.*)$/i);
+    const heading = headingMatch ? headingMatch[1] : null;
+    const rest = headingMatch ? headingMatch[2].trim() : trimmed;
+    if (!rest) return line;
+
+    const looksLikeConstraint = /(≤|≥|<=|>=|[<>])/.test(rest) && rest.length <= 150 &&
+      !/[{};]|function\s|def\s|class\s|for\s*\(|while\s*\(|return\s/.test(rest);
+    if (!looksLikeConstraint) return line;
+
+    const bullet = `- ${/`/.test(rest) ? rest : `\`${rest}\``}`;
+    return heading ? `${heading}\n\n${bullet}` : bullet;
+  }).join('\n');
+}
+
+// Detects a fenced code block whose every line "looks like" a constraint
+// (a short comparison expression, or a short plain-English sentence) rather
+// than actual code, and converts it into a real bullet list. Refuses to
+// touch anything that also contains Input/Output/Example markers — that
+// signals a mixed legacy block (example + constraints combined), which
+// should be left alone rather than partially bulleted.
+function looksLikeConstraintLine(line) {
+  if (!line || line.length > 120) return false;
+  const looksLikeCode = /[{};]|=>|function\s|def\s|class\s|for\s*\(|while\s*\(|return\s|console\.|System\.|public\s|private\s|import\s/.test(line);
+  if (looksLikeCode) return false;
+  if (/<=|>=|==|!=|≤|≥|[<>]/.test(line)) return true;
+  const words = line.split(/\s+/).length;
+  return words <= 14 && /^[A-Za-z`]/.test(line);
+}
+
+function fixConstraintsBlock(markdown) {
+  return markdown.replace(/```\n([\s\S]*?)\n```/g, (whole, body) => {
+    if (/\b(Input|Output|Example)\s*:/i.test(body)) return whole; // mixed block, leave it alone
+    const lines = body.split('\n').map(l => l.trim()).filter(Boolean);
+    if (!lines.length || !lines.every(looksLikeConstraintLine)) return whole;
+    return lines.map(line => `- ${/`/.test(line) ? line : `\`${line}\``}`).join('\n');
   });
-  out = out.replace(/<code[^>]*>([\s\S]*?)<\/code>/gi, (_, inner) =>
-    `\`${decodeEntities(inner.replace(/<[^>]+>/g, ''))}\``);
-  out = out.replace(/<li[^>]*>([\s\S]*?)<\/li>/gi, (_, inner) =>
-    `- ${decodeEntities(inner.replace(/<[^>]+>/g, '')).trim()}\n`);
-  out = out.replace(/<\/?(ul|ol)[^>]*>/gi, '\n');
-  out = out.replace(/<(strong|b)[^>]*>([\s\S]*?)<\/\1>/gi, (_, __, inner) =>
-    `**${decodeEntities(inner.replace(/<[^>]+>/g, '')).trim()}**`);
-  out = out.replace(/<(em|i)[^>]*>([\s\S]*?)<\/\1>/gi, (_, __, inner) =>
-    `*${decodeEntities(inner.replace(/<[^>]+>/g, '')).trim()}*`);
-  out = out.replace(/<sup[^>]*>([\s\S]*?)<\/sup>/gi, (_, inner) =>
-    `^${decodeEntities(inner.replace(/<[^>]+>/g, ''))}`);
-  out = out.replace(/<\/p>/gi, '\n\n').replace(/<p[^>]*>/gi, '');
-  out = out.replace(/<br\s*\/?>/gi, '\n');
-  out = out.replace(/<\/div>/gi, '\n').replace(/<div[^>]*>/gi, '');
-  out = out.replace(/<img[^>]*alt="([^"]*)"[^>]*>/gi, (_, alt) => alt ? `[image: ${alt}]` : '');
-  out = out.replace(/<img[^>]*>/gi, '');
-  out = out.replace(/<script[\s\S]*?<\/script>/gi, '');
-  out = out.replace(/<style[\s\S]*?<\/style>/gi, '');
-  out = out.replace(/<[^>]+>/g, '');
-  out = decodeEntities(out);
-  out = out.split('\n').map(l => l.replace(/[ \t]+$/g, '')).join('\n')
-    .replace(/\n{3,}/g, '\n\n').trim();
-  return out;
+}
+
+// Some GFG problems render multiple constraint clauses as one run-on line
+// with nothing but a stray space (or nothing at all) between them, e.g.
+// "2 ≤ arr.size() ≤ 10^61 ≤ arr[i] ≤ 10^7" — two separate constraints
+// squashed together with zero separator. This detects repeated
+// "value OP ... OP value" clauses within a line and splits each onto its
+// own bullet, treating exponent notation (10^6) as one atomic number so it
+// doesn't get misread as the start of the next clause.
+function splitConcatenatedConstraints(markdown) {
+  const clauseRe = /\d+(?:\^\d+)?\s*(?:≤|<=|>=|≥|<|>)\s*[^\d≤≥<>=\n^]+?\s*(?:≤|<=|>=|≥|<|>)\s*\d+(?:\^\d+)?/g;
+  return markdown.replace(/^(?!-\s).*(?:≤|<=|>=|≥).*(?:≤|<=|>=|≥).*$/gm, (line) => {
+    const clauses = line.match(clauseRe);
+    if (!clauses || clauses.length < 2) return line;
+
+    // Preserve any label before the first clause on the line (e.g.
+    // "**Constraints:**") instead of discarding it during the split.
+    const firstIdx = line.indexOf(clauses[0]);
+    const prefix = line.slice(0, firstIdx).trim();
+    const bullets = clauses.map(c => `- \`${c.trim()}\``).join('\n');
+
+    return prefix ? `${prefix}\n\n${bullets}` : bullets;
+  });
+}
+
+// Some examples show as separate "- Input: ..." / "- Output: ..." bullet
+// lines (from a real <li> list) while other examples on the SAME page show
+// as a proper boxed example (from a <pre> block) — a formatting
+// inconsistency GFG itself has, not something we introduced. This groups
+// consecutive Input/Output/Explanation bullets into one small fenced block
+// so every example ends up looking the same.
+function normalizeInlineExamples(markdown) {
+  return markdown.replace(
+    /(?:^- (?:Input|Output|Explanation):.*$\n?){2,}/gim,
+    (block) => {
+      const lines = block.trim().split('\n').map(l => l.replace(/^- /, ''));
+      return `\n\`\`\`\n${lines.join('\n')}\n\`\`\`\n`;
+    }
+  );
 }
 
 function renderReadme(entries) {
@@ -241,23 +320,44 @@ function renderReadme(entries) {
     ` &nbsp;|&nbsp; 🟢 Easy: ${counts.Easy || 0}` +
     ` &nbsp;|&nbsp; 🟡 Medium: ${counts.Medium || 0}` +
     ` &nbsp;|&nbsp; 🔴 Hard: ${counts.Hard || 0}\n\n` +
-    `_Auto-generated. Do not edit by hand — it will be overwritten on the next sync._\n\n` +
-    `| # | Problem | Difficulty | Language | Link |\n|---|---|---|---|---|\n`;
+    `_Auto-generated. Do not edit by hand — it will be overwritten on the next sync._\n\n`;
 
-  const rows = entries
-    .slice()
-    .sort((a, b) => a.title.localeCompare(b.title))
-    .map((e, i) => `| ${i + 1} | [${e.title}](${e.path}) | ${e.difficulty} | ${e.language} | ${e.url ? `[Solve](${e.url})` : '—'} |`)
-    .join('\n');
+  // Group by topic — a problem with several tags (e.g. Array, DP, Greedy on
+  // LeetCode) appears once in EACH relevant table, not just its first tag.
+  const byTopic = {};
+  entries.forEach(e => {
+    const topics = Array.isArray(e.topics) && e.topics.length
+      ? e.topics
+      : (e.topic ? [e.topic] : ['Uncategorized']); // back-compat with older entries
+    topics.forEach(topic => {
+      (byTopic[topic] = byTopic[topic] || []).push(e);
+    });
+  });
 
-  return header + rows + '\n';
+  const topics = Object.keys(byTopic).sort((a, b) => {
+    if (a === 'Uncategorized') return 1;
+    if (b === 'Uncategorized') return -1;
+    return a.localeCompare(b);
+  });
+
+  const sections = topics.map(topic => {
+    const rows = byTopic[topic]
+      .slice()
+      .sort((a, b) => a.title.localeCompare(b.title))
+      .map((e, i) => `| ${i + 1} | [${e.title}](${e.path}) | ${e.difficulty} | ${e.language} |`)
+      .join('\n');
+
+    return `## ${topic}\n\n| # | My Solution | Difficulty | Language |\n|---|---|---|---|\n${rows}`;
+  });
+
+  return header + sections.join('\n\n') + '\n';
 }
 
 // ─── Main push logic ─────────────────────────────────────────────────────────
 // Each file change is its own real git commit, chained sequentially.
 // GitHub counts every one of them in the contribution graph.
 
-async function recordAndPush({ token, owner, repo, slug, title, difficulty, language, description, code, url }) {
+async function recordAndPush({ token, owner, repo, slug, title, difficulty, language, description, code, url, topics }) {
   const folder = slug;
   const ext = extFor(language);
 
@@ -273,7 +373,8 @@ async function recordAndPush({ token, owner, repo, slug, title, difficulty, lang
 
   // Commit 2: problem description README (only if we have one)
   if (description) {
-    const readmeBody = `# ${title}\n\n**Difficulty:** ${difficulty}\n\n${description}\n`;
+    const heading = url ? `# [${title}](${url})` : `# ${title}`;
+    const readmeBody = `${heading}\n\n**Difficulty:** ${difficulty}\n\n${description}\n`;
     head = await pushCommit(
       token, owner, repo, head,
       [{ path: `${folder}/README.md`, content: readmeBody }],
@@ -292,7 +393,7 @@ async function recordAndPush({ token, owner, repo, slug, title, difficulty, lang
 
   const stats = statsResult.data;
   const idx = stats.findIndex(e => e.slug === slug);
-  const entry = { slug, title, difficulty, language, path: `${folder}/`, url };
+  const entry = { slug, title, difficulty, language, path: `${folder}/`, url, topics: (topics && topics.length ? topics : ['Uncategorized']) };
   if (idx >= 0) stats[idx] = entry; else stats.push(entry);
 
   head = await pushCommit(
@@ -316,7 +417,7 @@ async function fetchLeetCodeProblem(slug) {
     method: 'POST',
     headers: { 'Content-Type': 'application/json' },
     body: JSON.stringify({
-      query: `query($slug: String!) { question(titleSlug: $slug) { title difficulty content } }`,
+      query: `query($slug: String!) { question(titleSlug: $slug) { title difficulty content topicTags { name } } }`,
       variables: { slug }
     })
   });
@@ -339,15 +440,17 @@ async function handleMessage(msg) {
 
     const [owner, repo] = leetcodeRepo.split('/');
     const problem = await fetchLeetCodeProblem(msg.slug);
+    const description = await htmlToMarkdown(problem?.content);
     await recordAndPush({
       token, owner, repo,
       slug: msg.slug,
       title: problem?.title || msg.slug,
       difficulty: problem?.difficulty || 'Unknown',
       language: msg.lang,
-      description: htmlToMarkdown(problem?.content),
+      description,
       code: msg.code,
-      url: `https://leetcode.com/problems/${msg.slug}/`
+      url: `https://leetcode.com/problems/${msg.slug}/`,
+      topics: (problem?.topicTags || []).map(t => t.name)
     });
   }
 
@@ -360,15 +463,17 @@ async function handleMessage(msg) {
     }
 
     const [owner, repo] = gfgRepo.split('/');
+    const description = await htmlToMarkdown(msg.description);
     await recordAndPush({
       token, owner, repo,
       slug: msg.slug,
       title: msg.title || msg.slug,
       difficulty: msg.difficulty || 'Unknown',
       language: msg.lang,
-      description: htmlToMarkdown(msg.description),
+      description,
       code: msg.code,
-      url: `https://www.geeksforgeeks.org/problems/${msg.slug}/1`
+      url: `https://www.geeksforgeeks.org/problems/${msg.slug}/1`,
+      topics: msg.topics
     });
   }
 }
