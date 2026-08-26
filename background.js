@@ -484,3 +484,51 @@ chrome.runtime.onMessage.addListener((msg, sender, sendResponse) => {
     .catch(err => { console.error('[private-sync]', err); sendResponse({ ok: false, error: String(err) }); });
   return true;
 });
+
+const RECONNECT_TARGETS = [
+  {
+    pattern: 'https://leetcode.com/problems/*',
+    files: [
+      { file: 'content-scripts/leetcode-main.js', world: 'MAIN' },
+      { file: 'content-scripts/leetcode-bridge.js' }
+    ]
+  },
+  {
+    pattern: 'https://www.geeksforgeeks.org/problems/*',
+    files: [
+      { file: 'content-scripts/gfg-main.js', world: 'MAIN' },
+      { file: 'content-scripts/gfg-bridge.js' }
+    ]
+  }
+];
+
+async function reconnectOpenTabs() {
+  for (const { pattern, files } of RECONNECT_TARGETS) {
+    let tabs = [];
+    try {
+      tabs = await chrome.tabs.query({ url: pattern });
+    } catch (e) {
+      console.warn('[private-sync] Could not query tabs for', pattern, e);
+      continue;
+    }
+
+    for (const tab of tabs) {
+      for (const { file, world } of files) {
+        try {
+          await chrome.scripting.executeScript({
+            target: { tabId: tab.id },
+            files: [file],
+            ...(world ? { world } : {})
+          });
+        } catch (e) {
+          // Tab may have navigated away or closed between query and inject — harmless.
+          console.warn('[private-sync] Reinject skipped for tab', tab.id, file, e);
+        }
+      }
+    }
+  }
+}
+
+chrome.runtime.onInstalled.addListener(() => reconnectOpenTabs());
+
+chrome.runtime.onStartup.addListener(() => reconnectOpenTabs());
