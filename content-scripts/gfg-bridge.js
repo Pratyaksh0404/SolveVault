@@ -1,17 +1,26 @@
 // content-scripts/gfg-bridge.js  (isolated world — has chrome.* access)
 
-if (!chrome?.runtime?.id) {
-  if (!sessionStorage.getItem('__privateSyncReloaded')) {
-    sessionStorage.setItem('__privateSyncReloaded', '1');
-    location.reload();
+(() => {
+
+  const myGeneration = Symbol('gfg-bridge-generation');
+  window.__privateSyncGfgBridgeGeneration = myGeneration;
+
+  if (!chrome?.runtime?.id) {
+    if (!sessionStorage.getItem('__privateSyncReloaded')) {
+      sessionStorage.setItem('__privateSyncReloaded', '1');
+      location.reload();
+    }
+    return;
   }
-} else {
+
   sessionStorage.removeItem('__privateSyncReloaded');
 
   window.addEventListener('message', (event) => {
     if (event.source !== window) return;
     if (event.data?.type !== 'PRIVATE_SYNC_SUCCESS') return;
     if (event.data.platform !== 'gfg') return;
+
+    if (window.__privateSyncGfgBridgeGeneration !== myGeneration) return;
 
     if (!chrome?.runtime?.id) {
       console.warn('[private-sync] Extension was reloaded mid-session — this submission could not be sent. Reloading the tab now so the next one works without manual intervention.');
@@ -30,4 +39,4 @@ if (!chrome?.runtime?.id) {
       description: event.data.description
     });
   });
-}
+})();
