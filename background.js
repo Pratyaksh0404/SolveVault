@@ -13,6 +13,8 @@
 // Data API to construct real git commits — the same object model that
 // `git push` produces. GitHub counts each of these commits individually
 // in the contribution graph, so 4 commits per problem = 4 green squares.
+// The four commits are built first and `main` is moved once at the end, so
+// they arrive as a single push of four commits, like `git push` does.
 //
 // Nothing else is ever contacted. Nothing is ever written to disk.
 // The token lives only in chrome.storage.local (this browser profile).
@@ -33,6 +35,19 @@ function extFor(lang) {
 
 async function getConfig() {
   return chrome.storage.local.get(['token', 'leetcodeRepo', 'gfgRepo']);
+}
+
+// Accepts "owner/repo", "https://github.com/owner/repo", "owner/repo.git",
+// and tolerates stray whitespace. Returns null if it can't be parsed.
+function parseRepo(value) {
+  const cleaned = String(value || '')
+    .trim()
+    .replace(/^https?:\/\/github\.com\//i, '')
+    .replace(/\.git$/i, '')
+    .replace(/^\/+|\/+$/g, '');
+  const parts = cleaned.split('/');
+  if (parts.length !== 2 || !parts[0] || !parts[1]) return null;
+  return { owner: parts[0], repo: parts[1] };
 }
 
 function b64(str) {
@@ -112,11 +127,43 @@ async function createTree(token, owner, repo, baseTreeSha, files) {
   return data.sha;
 }
 
+// The identity to stamp on commits. GitHub only counts a commit toward the
+// contribution graph if its author email belongs to the account, so rather
+// than relying on whatever the API infers, use the account's own noreply
+// address (<id>+<login>@users.noreply.github.com), which is always linked.
+// If the lookup fails, commits are made without an explicit author and
+// GitHub falls back to the token owner, as before.
+let identityCache = null;
+
+async function getIdentity(token) {
+  if (identityCache && identityCache.token === token) return identityCache.value;
+  try {
+    const res = await ghFetch(token, '/user');
+    if (!res.ok) return null;
+    const u = await res.json();
+    if (!u.id || !u.login) return null;
+    const value = { name: u.name || u.login, email: `${u.id}+${u.login}@users.noreply.github.com` };
+    identityCache = { token, value };
+    return value;
+  } catch {
+    return null;
+  }
+}
+
 // Create a commit object pointing at a tree, with a parent commit
 async function createCommit(token, owner, repo, message, treeSha, parentSha) {
+  const payload = { message, tree: treeSha, parents: [parentSha] };
+
+  const identity = await getIdentity(token);
+  if (identity) {
+    const stamp = { ...identity, date: new Date().toISOString().replace(/\.\d{3}Z$/, 'Z') };
+    payload.author = stamp;
+    payload.committer = stamp;
+  }
+
   const res = await ghFetch(token, `/repos/${owner}/${repo}/git/commits`, {
     method: 'POST',
-    body: JSON.stringify({ message, tree: treeSha, parents: [parentSha] })
+    body: JSON.stringify(payload)
   });
   if (!res.ok) throw new Error(`createCommit failed: ${res.status} ${await res.text()}`);
   const data = await res.json();
@@ -132,14 +179,14 @@ async function updateRef(token, owner, repo, commitSha) {
   if (!res.ok) throw new Error(`updateRef failed: ${res.status} ${await res.text()}`);
 }
 
-// Push a single commit containing one or more files, chained onto the
-// current HEAD. Returns the new HEAD SHA so the next push can chain off it.
-async function pushCommit(token, owner, repo, headSha, files, message) {
-  const treeSha = await getCommitTreeSha(token, owner, repo, headSha);
+// Build ONE commit on top of parentSha WITHOUT moving the branch, and return
+// the new commit's SHA. Git objects are addressable by SHA as soon as they
+// exist, so the next commit can be chained onto this one before any branch
+// pointer has moved. The caller moves `main` once, after every commit is built.
+async function buildCommit(token, owner, repo, parentSha, files, message) {
+  const treeSha = await getCommitTreeSha(token, owner, repo, parentSha);
   const newTreeSha = await createTree(token, owner, repo, treeSha, files);
-  const newCommitSha = await createCommit(token, owner, repo, message, newTreeSha, headSha);
-  await updateRef(token, owner, repo, newCommitSha);
-  return newCommitSha; // caller chains the next commit off this
+  return createCommit(token, owner, repo, message, newTreeSha, parentSha);
 }
 
 // ─── Stats / README helpers ──────────────────────────────────────────────────
@@ -154,6 +201,34 @@ async function getJsonFile(token, owner, repo, path, fallback) {
   } catch {
     return { data: null, ok: false };
   }
+}
+
+// ─── Concurrency guards ──────────────────────────────────────────────────────
+// Two problems these solve:
+//
+// 1. The same submission can reach this file twice within milliseconds
+//    (e.g. a page-script injected twice after an extension reload). The
+//    persistent dedupe store below can't stop that on its own, because it
+//    does read → await → write, so two near-simultaneous messages both
+//    read "not seen yet". `inFlight` is checked and set synchronously,
+//    before any await, so only the first message proceeds.
+//
+// 2. Two different problems submitted close together would otherwise build
+//    commit chains on the same branch at the same time, and one chain's
+//    ref update fails as a non-fast-forward. `enqueue` runs pushes to the
+//    same repo strictly one after another.
+const inFlight = new Set();
+const repoQueues = new Map();
+
+function enqueue(key, task) {
+  const prev = repoQueues.get(key) || Promise.resolve();
+  const next = prev.catch(() => {}).then(task);
+  repoQueues.set(key, next);
+  // Don't let the map grow forever
+  next.finally(() => {
+    if (repoQueues.get(key) === next) repoQueues.delete(key);
+  }).catch(() => {});
+  return next;
 }
 
 // ─── Duplicate-push guard ────────────────────────────────────────────────────
@@ -190,34 +265,90 @@ async function isDuplicatePush(dedupeKey, permanent) {
   return false;
 }
 
+// If a push fails, forget that we ever tried it — otherwise the failed
+// submission stays marked as "already pushed" and a retry is silently skipped.
+async function releaseDedupeKey(dedupeKey) {
+  const { [DEDUPE_STORE_KEY]: store = {} } = await chrome.storage.local.get(DEDUPE_STORE_KEY);
+  if (store[dedupeKey] === undefined) return;
+  delete store[dedupeKey];
+  await chrome.storage.local.set({ [DEDUPE_STORE_KEY]: store });
+}
+
 // ─── Offscreen document management ───────────────────────────────────────────
 // The service worker has no DOM, so real HTML parsing happens in a hidden
 // offscreen document instead (offscreen.js) — see manifest.json's
-// "offscreen" permission. This replaces the old regex-based HTML-to-Markdown
-// converter, which kept breaking on edge cases regex fundamentally can't
-// distinguish (e.g. "this dash is a bullet" vs "this dash is in a code
-// example") — a real parser sees the actual tag structure instead of
-// guessing from text patterns.
-let offscreenReady = null;
+// "offscreen" permission. A real parser sees the actual tag structure
+// instead of guessing from text patterns.
+let offscreenCreating = null;
+
+async function hasOffscreenDocument() {
+  if (!chrome.runtime.getContexts) return false;
+  try {
+    const contexts = await chrome.runtime.getContexts({ contextTypes: ['OFFSCREEN_DOCUMENT'] });
+    return contexts.length > 0;
+  } catch {
+    return false;
+  }
+}
 
 async function ensureOffscreenDocument() {
-  if (offscreenReady) return offscreenReady;
-  offscreenReady = chrome.offscreen.createDocument({
-    url: 'offscreen.html',
-    reasons: ['DOM_PARSER'],
-    justification: 'Parse problem HTML into Markdown using DOMParser, unavailable in the service worker.'
-  }).catch(err => {
-    // Already exists (e.g. survived a service worker restart) — fine.
-    if (!/already exists|single offscreen/i.test(String(err))) throw err;
-  });
-  return offscreenReady;
+  if (await hasOffscreenDocument()) return;
+  if (!offscreenCreating) {
+    offscreenCreating = chrome.offscreen.createDocument({
+      url: 'offscreen.html',
+      reasons: ['DOM_PARSER'],
+      justification: 'Parse problem HTML into Markdown using DOMParser, unavailable in the service worker.'
+    }).catch(err => {
+      // Already exists (e.g. survived a service worker restart) — fine.
+      if (!/already exists|single offscreen/i.test(String(err))) throw err;
+    }).finally(() => {
+      offscreenCreating = null;
+    });
+  }
+  await offscreenCreating;
+}
+
+// Last-resort text extraction if the offscreen parser can't be reached, so a
+// problem description is never lost entirely.
+function crudeStripHtml(html) {
+  return html
+    .replace(/<\s*br\s*\/?>/gi, '\n')
+    .replace(/<\/(p|div|li|pre|h[1-6])>/gi, '\n\n')
+    .replace(/<[^>]+>/g, '')
+    .replace(/&nbsp;/g, ' ')
+    .replace(/&lt;/g, '<')
+    .replace(/&gt;/g, '>')
+    .replace(/&amp;/g, '&')
+    .replace(/&quot;/g, '"')
+    .replace(/&#39;/g, "'")
+    .replace(/\n{3,}/g, '\n\n')
+    .trim();
 }
 
 async function htmlToMarkdown(html) {
   if (!html) return '';
-  await ensureOffscreenDocument();
-  const response = await chrome.runtime.sendMessage({ target: 'offscreen', type: 'CONVERT_HTML', html });
-  const converted = response?.markdown || '';
+
+  let converted = '';
+  for (let attempt = 0; attempt < 3; attempt++) {
+    try {
+      await ensureOffscreenDocument();
+      const response = await chrome.runtime.sendMessage({ target: 'offscreen', type: 'CONVERT_HTML', html });
+      if (response && typeof response.markdown === 'string' && response.markdown.trim()) {
+        converted = response.markdown;
+        break;
+      }
+    } catch (e) {
+      console.warn('[private-sync] HTML→Markdown attempt failed:', e);
+    }
+    // The offscreen document may still be starting up — wait and retry.
+    await new Promise(r => setTimeout(r, 300 * (attempt + 1)));
+  }
+
+  if (!converted) {
+    console.warn('[private-sync] HTML→Markdown conversion returned nothing — falling back to plain text.');
+    return crudeStripHtml(html);
+  }
+
   return bulletizeLeftoverConstraints(normalizeInlineExamples(splitConcatenatedConstraints(fixConstraintsBlock(converted))));
 }
 
@@ -354,40 +485,49 @@ function renderReadme(entries) {
 }
 
 // ─── Main push logic ─────────────────────────────────────────────────────────
-// Each file change is its own real git commit, chained sequentially.
-// GitHub counts every one of them in the contribution graph.
+// Four real git commits are built one on top of another, then `main` is
+// moved ONCE to the last of them. That is exactly what `git push` of four
+// commits does: a single push event carrying four commits, which GitHub
+// counts as four contributions. (Moving the branch after every commit
+// produced four rapid-fire push events, and the contribution graph
+// processed those unreliably — sometimes counting only 1, 2 or 3.)
+//
+// All four commits are ALWAYS made, even if the problem description could not
+// be fetched — in that case the README holds a short placeholder instead.
+
+const NO_DESCRIPTION_TEXT = '_The problem description was not available when this solution was synced._';
 
 async function recordAndPush({ token, owner, repo, slug, title, difficulty, language, description, code, url, topics }) {
   const folder = slug;
   const ext = extFor(language);
 
-  // Get current HEAD once — each pushCommit returns the new HEAD for the next
   let head = await getHeadSha(token, owner, repo);
 
   // Commit 1: solution code
-  head = await pushCommit(
+  head = await buildCommit(
     token, owner, repo, head,
     [{ path: `${folder}/Solution.${ext}`, content: code }],
     `feat: solve ${title}`
   );
 
-  // Commit 2: problem description README (only if we have one)
-  if (description) {
-    const heading = url ? `# [${title}](${url})` : `# ${title}`;
-    const readmeBody = `${heading}\n\n**Difficulty:** ${difficulty}\n\n${description}\n`;
-    head = await pushCommit(
-      token, owner, repo, head,
-      [{ path: `${folder}/README.md`, content: readmeBody }],
-      `docs: add ${title} description`
-    );
-  }
+  // Commit 2: problem description README (always — placeholder if empty)
+  const heading = url ? `# [${title}](${url})` : `# ${title}`;
+  const body = description && description.trim() ? description : NO_DESCRIPTION_TEXT;
+  const readmeBody = `${heading}\n\n**Difficulty:** ${difficulty}\n\n${body}\n`;
+  head = await buildCommit(
+    token, owner, repo, head,
+    [{ path: `${folder}/README.md`, content: readmeBody }],
+    `docs: add ${title} description`
+  );
 
   // Commit 3: update stats.json
+  // (Reading it from main is safe: commits 1 and 2 don't touch this file.)
   const statsPath = '.sync-meta/stats.json';
   const statsResult = await getJsonFile(token, owner, repo, statsPath, []);
 
   if (!statsResult.ok) {
     console.error(`[private-sync] Could not read stats.json safely — skipping stats/README update for "${title}" to avoid data loss. Solution files were still pushed.`);
+    await updateRef(token, owner, repo, head); // still publish commits 1 and 2
     return;
   }
 
@@ -396,18 +536,36 @@ async function recordAndPush({ token, owner, repo, slug, title, difficulty, lang
   const entry = { slug, title, difficulty, language, path: `${folder}/`, url, topics: (topics && topics.length ? topics : ['Uncategorized']) };
   if (idx >= 0) stats[idx] = entry; else stats.push(entry);
 
-  head = await pushCommit(
+  head = await buildCommit(
     token, owner, repo, head,
     [{ path: statsPath, content: JSON.stringify(stats, null, 2) }],
     `chore: update stats (${title})`
   );
 
   // Commit 4: update root README
-  await pushCommit(
+  head = await buildCommit(
     token, owner, repo, head,
     [{ path: 'README.md', content: renderReadme(stats) }],
     `docs: update README (${title})`
   );
+
+  // One push: move main to the last commit, publishing all four together.
+  await updateRef(token, owner, repo, head);
+}
+
+// If the branch moved underneath us (something else pushed to main between
+// our read and our update), the ref update is rejected and nothing has
+// landed. Rebuild the commits on the new head and try once more.
+async function recordAndPushWithRetry(args) {
+  try {
+    return await recordAndPush(args);
+  } catch (e) {
+    if (/updateRef failed: 422/.test(String(e))) {
+      console.warn('[private-sync] main moved during push — rebuilding on the new head and retrying once.');
+      return recordAndPush(args);
+    }
+    throw e;
+  }
 }
 
 // ─── Platform handlers ───────────────────────────────────────────────────────
@@ -426,59 +584,90 @@ async function fetchLeetCodeProblem(slug) {
 }
 
 async function handleMessage(msg) {
-  const { token, leetcodeRepo, gfgRepo } = await getConfig();
-  if (!token) { console.warn('[private-sync] No GitHub token set — open the extension options page.'); return; }
+  if (!msg || (msg.platform !== 'leetcode' && msg.platform !== 'gfg')) return;
 
-  if (msg.platform === 'leetcode') {
-    if (!leetcodeRepo) { console.warn('[private-sync] No LeetCode repo configured.'); return; }
+  // Work out the dedupe key up front, synchronously, so the in-flight check
+  // below happens before any await and two identical messages can't both pass.
+  const isLeetcode = msg.platform === 'leetcode';
+  const dedupeKey = isLeetcode
+    ? (msg.submissionId ? `leetcode:sub:${msg.submissionId}` : `leetcode:slug:${msg.slug}`)
+    : `gfg:slug:${msg.slug}`;
+  const permanent = isLeetcode && !!msg.submissionId;
 
-    const dedupeKey = msg.submissionId ? `leetcode:sub:${msg.submissionId}` : `leetcode:slug:${msg.slug}`;
-    if (await isDuplicatePush(dedupeKey, !!msg.submissionId)) {
-      console.log(`[private-sync] Skipped duplicate push for ${msg.slug} (submission ${msg.submissionId})`);
-      return;
-    }
-
-    const [owner, repo] = leetcodeRepo.split('/');
-    const problem = await fetchLeetCodeProblem(msg.slug);
-    const description = await htmlToMarkdown(problem?.content);
-    await recordAndPush({
-      token, owner, repo,
-      slug: msg.slug,
-      title: problem?.title || msg.slug,
-      difficulty: problem?.difficulty || 'Unknown',
-      language: msg.lang,
-      description,
-      code: msg.code,
-      url: `https://leetcode.com/problems/${msg.slug}/`,
-      topics: (problem?.topicTags || []).map(t => t.name)
-    });
+  if (inFlight.has(dedupeKey)) {
+    console.log(`[private-sync] Already processing ${dedupeKey} — ignoring duplicate message.`);
+    return;
   }
+  inFlight.add(dedupeKey);
 
-  if (msg.platform === 'gfg') {
-    if (!gfgRepo) { console.warn('[private-sync] No GFG repo configured.'); return; }
+  let claimed = false; // true once the persistent dedupe store has recorded this push
+  try {
+    const { token, leetcodeRepo, gfgRepo } = await getConfig();
+    if (!token) { console.warn('[private-sync] No GitHub token set — open the extension options page.'); return; }
 
-    if (await isDuplicatePush(`gfg:slug:${msg.slug}`, false)) {
-      console.log(`[private-sync] Skipped duplicate push for ${msg.slug}`);
+    const repoValue = isLeetcode ? leetcodeRepo : gfgRepo;
+    if (!repoValue) {
+      console.warn(`[private-sync] No ${isLeetcode ? 'LeetCode' : 'GFG'} repo configured.`);
       return;
     }
+    const parsed = parseRepo(repoValue);
+    if (!parsed) {
+      console.error(`[private-sync] Repo "${repoValue}" is not in "owner/repo" form — fix it in the options page.`);
+      return;
+    }
+    const { owner, repo } = parsed;
 
-    const [owner, repo] = gfgRepo.split('/');
-    const description = await htmlToMarkdown(msg.description);
-    await recordAndPush({
-      token, owner, repo,
-      slug: msg.slug,
-      title: msg.title || msg.slug,
-      difficulty: msg.difficulty || 'Unknown',
-      language: msg.lang,
-      description,
-      code: msg.code,
-      url: `https://www.geeksforgeeks.org/problems/${msg.slug}/1`,
-      topics: msg.topics
-    });
+    if (await isDuplicatePush(dedupeKey, permanent)) {
+      console.log(`[private-sync] Skipped duplicate push for ${msg.slug}` + (msg.submissionId ? ` (submission ${msg.submissionId})` : ''));
+      return;
+    }
+    claimed = true;
+
+    if (isLeetcode) {
+      const problem = await fetchLeetCodeProblem(msg.slug);
+      const description = await htmlToMarkdown(problem?.content);
+      await enqueue(`${owner}/${repo}`, () => recordAndPushWithRetry({
+        token, owner, repo,
+        slug: msg.slug,
+        title: problem?.title || msg.slug,
+        difficulty: problem?.difficulty || 'Unknown',
+        language: msg.lang,
+        description,
+        code: msg.code,
+        url: `https://leetcode.com/problems/${msg.slug}/`,
+        topics: (problem?.topicTags || []).map(t => t.name)
+      }));
+    } else {
+      const description = await htmlToMarkdown(msg.description);
+      if (!description) {
+        console.warn(`[private-sync] GFG message for "${msg.slug}" had no description — using placeholder README.`);
+      }
+      await enqueue(`${owner}/${repo}`, () => recordAndPushWithRetry({
+        token, owner, repo,
+        slug: msg.slug,
+        title: msg.title || msg.slug,
+        difficulty: msg.difficulty || 'Unknown',
+        language: msg.lang,
+        description,
+        code: msg.code,
+        url: `https://www.geeksforgeeks.org/problems/${msg.slug}/1`,
+        topics: msg.topics
+      }));
+    }
+  } catch (err) {
+    // Let a retry of this same submission go through instead of being
+    // silently skipped as an "already pushed" duplicate.
+    if (claimed) await releaseDedupeKey(dedupeKey).catch(() => {});
+    throw err;
+  } finally {
+    inFlight.delete(dedupeKey);
   }
 }
 
 chrome.runtime.onMessage.addListener((msg, sender, sendResponse) => {
+  // Messages addressed to the offscreen document aren't ours to answer.
+  if (!msg || msg.target === 'offscreen') return false;
+
   handleMessage(msg)
     .then(() => sendResponse({ ok: true }))
     .catch(err => { console.error('[private-sync]', err); sendResponse({ ok: false, error: String(err) }); });
